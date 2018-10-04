@@ -3,3 +3,5 @@
 __pycache*
 data/*
 !data/sample_sub*
+submissions/*
+lgbm_models/*

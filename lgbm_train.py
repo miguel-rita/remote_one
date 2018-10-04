@@ -2,20 +2,29 @@ import os, re
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt
+import seaborn as sns
 import feat_engineering
+import ensembling_utils
 
-RND_SEED = 67213
+# Loading, preprocess, feat engineering
 
 # Load dataframe
 df = pd.read_pickle(os.getcwd() + '/data/df_one.pkl')
 print('> LGBM Train : Loaded preprocessed df')
 
 print('> LGBM Train : Beginning feat engineering . . .')
+
 # Feat engineering
 df = feat_engineering.create_features(df)
 df, cat_col_nums = feat_engineering.encoder(df)
 print('> LGBM Train : Finished feat engineering')
+
+
+
+
+
+# Wrangling
 
 # Separate train and validation dfs
 train_test_df = df.loc['train'].copy()
@@ -24,42 +33,44 @@ val_df = df.loc['test'].copy()
 # To numpy
 x_train_test = train_test_df.iloc[:,1:-1].values
 y_train_test = train_test_df.iloc[:,-1].values
-
-user_ids = train_test_df.iloc[:,0].astype(float).values
 x_val = val_df.iloc[:,1:-1].values # Drop dummy labels
 
 # Set log1p of labels
 y_train_test = np.log1p(y_train_test)
 
-# Setup CV
-groups = y_train_test > 0
-skf = StratifiedKFold(
-    n_splits=5,
-    shuffle=True,
-    #random_state=RND_SEED,
-)
+# Get training CV folds
+num_folds = 5
+user_folds = ensembling_utils.get_folds(train_test_df, num_folds)
 
-cv_scores = []
-bsts = []
+
+
+
 
 # CV main loop
-for i, (train_index, test_index) in enumerate(skf.split(x_train_test, groups)):
+
+# Loop collector vars
+cv_scores = []
+bsts = []
+importances = pd.DataFrame()
+
+# Pipeline variables
+oof_y_train_test_pred = np.zeros(y_train_test.shape[0])
+y_val_preds_sess = np.zeros((x_val.shape[0], num_folds))
+
+for i, (train_index, test_index) in enumerate(user_folds):
 
     # Get current fold
-    x_train = x_train_test[train_index]
-    y_train = y_train_test[train_index]
-    x_test = x_train_test[test_index]
-    y_test = y_train_test[test_index]
-    eval_group = user_ids[test_index]
+    x_train, y_train = x_train_test[train_index], y_train_test[train_index]
+    x_test, y_test = x_train_test[test_index], y_train_test[test_index]
 
     # Create lgb booster
     bst = lgb.LGBMModel(
         objective='regression',
-        num_leaves = 62,
-        learning_rate = 0.080,
+        num_leaves = 73,
+        learning_rate = 0.072,
         n_estimators = 10000,
         min_child_samples= 155,
-        subsample=0.98,
+        subsample=0.99,
         reg_lambda=0.0,
     )
 
@@ -73,33 +84,38 @@ for i, (train_index, test_index) in enumerate(skf.split(x_train_test, groups)):
         verbose=False,
     )
 
-    # Calculate competition metric below
+    # Calculate metrics below
+
+    # Aux visualization
+    imp_df = pd.DataFrame()
+    imp_df['feature'] = train_test_df.columns[1:-1]
+    imp_df['gain'] = bst.booster_.feature_importance(importance_type='gain')
+    imp_df['fold'] = i + 1
+    importances = pd.concat([importances, imp_df], axis=0, sort=False)
 
     # Predict
-    y_pred = bst.predict(x_test)
-    y_pred = np.clip(y_pred, 0, np.inf)
-    y_pred = np.expm1(np.squeeze(y_pred))
+    y_pred = bst.predict(x_test, num_iteration=bst.best_iteration_)
+    y_pred = np.squeeze(np.clip(y_pred, 0, np.inf))
 
-    # Build dataframe with predictions and truth per session
-    session_df = train_test_df.iloc[test_index, [0, -1]].copy()
-    session_df['y_pred'] = y_pred
+    # Store OF prediction
+    oof_y_train_test_pred[test_index] = y_pred
 
-    # Aggregate pred and truth per user
-    y_true_user = session_df.groupby('fullVisitorId')['totals.transactionRevenue'].sum().values
-    y_pred_user = session_df.groupby('fullVisitorId')['y_pred'].sum().values
+    # Store SUB prediction
+    _sub_pred = bst.predict(x_val, num_iteration=bst.best_iteration_)
+    y_val_preds_sess[:, i] = np.squeeze(np.clip(_sub_pred, 0, np.inf))
 
-    # Apply log1p to aggregated predictions
-    y_pred_user = np.log1p(y_pred_user)
-    y_true_user = np.log1p(y_true_user)
+    # Session level loss
+    val_loss = np.sqrt(np.mean((y_pred - y_test)**2))
 
-    # Comp. metric
-    val_loss = np.sqrt(np.mean(np.power(y_pred_user - y_true_user, 2)))
-
-    print('Competition metric : ',val_loss)
+    print('User-level RMSE : ',val_loss)
     cv_scores.append(val_loss)
     bsts.append(bst)
 
-# Save model committee
+
+
+
+
+# Save model committee (3 steps)
 
 # Setup folder name
 saved_names = os.listdir(os.getcwd() + '/lgbm_models/')
@@ -110,9 +126,25 @@ if saved_names:
         model_num = num if num>model_num else model_num
 folder_name = f'bst_model{model_num:d}_{i+1:d}_avg_cv_{np.mean(cv_scores):.5f}/'
 
-# Create folder to save model and scaler
+# Create folder to save model
 dir_path = os.getcwd() + '/lgbm_models/' + folder_name
 os.mkdir(dir_path)
 
+# Save committee
 for i, (bst, cv_score) in enumerate(zip(bsts, cv_scores)):
     bst.booster_.save_model(os.getcwd() + '/lgbm_models/' + folder_name + f'bst{i:d}_cv_fold_{cv_score:.5f}.txt')
+
+
+
+
+
+# Visualization of importances
+
+if False:
+    # TODO - Examine zero log gain feats
+
+    importances['gain_log'] = np.log1p(importances['gain'])
+    mean_gain = importances[['gain', 'feature']].groupby('feature').mean()
+    importances['mean_gain'] = importances['feature'].map(mean_gain['gain'])
+    plt.figure(figsize=(8, 12))
+    sns.barplot(x='gain_log', y='feature', data=importances.sort_values('mean_gain', ascending=False))

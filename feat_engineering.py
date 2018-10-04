@@ -1,5 +1,3 @@
-import utils
-
 def create_features(df_orig):
     '''
     Module to generate new features

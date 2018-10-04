@@ -18,7 +18,7 @@ x_val = val_df.iloc[:,1:-1].values # Drop dummy labels
 print('> LGBM Predict : Done loading data. Loading LGBM booster ensemble . . .')
 
 # Load booster ensemble
-boost_folder_name = 'bst_model32_5_avg_cv_1.60272'
+boost_folder_name = 'bst_model39_5_avg_cv_1.60090'
 mean_cv_str = boost_folder_name[-7:]
 boost_dir = '/lgbm_models/' + boost_folder_name + '/'
 bsts = []
