@@ -1,0 +1,5 @@
+.idea*
+.ipy*
+__pycache*
+data/*
+!data/sample_sub*
