@@ -5,3 +5,5 @@ data/*
 !data/sample_sub*
 submissions/*
 lgbm_models/*
+!submissions/place*
+!lgbm_models/place*
