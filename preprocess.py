@@ -1,6 +1,6 @@
 import pandas as pd
 
-num_rows = None
+num_rows = 10000
 
 print(f'> Preprocessing : Loading raw csv files . . .')
 train_df = pd.read_csv('data/train-flat.csv', dtype={'fullVisitorId' : str}, nrows=num_rows, low_memory=False)
@@ -132,6 +132,6 @@ cols.append(cols.pop(cols.index('totals.transactionRevenue')))
 cols.insert(0, cols.pop(cols.index('fullVisitorId')))
 df = df[cols]
 
-df.to_pickle('data/df_one.pkl')
+df.to_pickle('data/df_one_r.pkl')
 
 print(f'> Preprocessing : DONE')
