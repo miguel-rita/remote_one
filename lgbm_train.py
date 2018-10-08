@@ -2,6 +2,7 @@ import os, re, gc
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import pickle
 import matplotlib.pyplot as plt
 import seaborn as sns
 import feat_engineering
@@ -18,18 +19,25 @@ print('> LGBM Train : Beginning feat engineering . . .')
 
 # Feat engineering
 df = feat_engineering.create_features(df)
+df = df.drop(['visitStartTime'], axis=1)
 df, cat_col_nums = feat_engineering.encoder(df)
-print('> LGBM Train : Finished feat engineering')
 
+print('> LGBM Train : Finished feat engineering')
+print('All cols:')
+for c in df.columns:
+    print(c)
+print('\n\nSELECTED CATS:')
+for i in cat_col_nums:
+    print(df.columns[i+1])
 
 
 
 
 # Wrangling
 
-# Separate train and validation dfs
-train_test_df = df.loc['train'].copy()
-val_df = df.loc['test'].copy()
+# Separate train and validation dfs - always work with sorted sessions by Id from now on
+train_test_df = df.loc['train'].copy().sort_values('fullVisitorId')
+val_df = df.loc['test'].copy().sort_values('fullVisitorId')
 
 # To numpy
 x_train_test = train_test_df.iloc[:,1:-1].values
@@ -41,7 +49,7 @@ y_train_test = np.log1p(y_train_test)
 
 # Get training CV folds
 num_folds = 5
-user_folds = ensembling_utils.get_folds(train_test_df, num_folds)
+sess_folds, user_folds = ensembling_utils.get_folds(train_test_df['fullVisitorId'], num_folds)
 
 
 
@@ -58,7 +66,8 @@ importances = pd.DataFrame()
 oof_y_train_test_pred = np.zeros(y_train_test.shape[0])
 y_val_preds_sess = np.zeros((x_val.shape[0], num_folds))
 
-for i, (train_index, test_index) in enumerate(user_folds):
+
+for i, (train_index, test_index) in enumerate(sess_folds):
 
     # Get current fold
     x_train, y_train = x_train_test[train_index], y_train_test[train_index]
@@ -67,10 +76,10 @@ for i, (train_index, test_index) in enumerate(user_folds):
     # Create lgb booster
     bst = lgb.LGBMModel(
         objective='regression',
-        num_leaves = 73,
-        learning_rate = 0.072,
-        n_estimators = 10000,
-        min_child_samples= 155,
+        num_leaves=73,
+        learning_rate=0.072,
+        n_estimators=10000,
+        min_child_samples=155,
         subsample=0.99,
         reg_lambda=0.0,
     )
@@ -165,19 +174,16 @@ pred_col_names = [
     'sess_cv_avg_exp_pred'
 ]
 sess_dfs = [df.loc[:,['fullVisitorId', pred_col_names[i]]] for i,df in enumerate([train_test_df, val_df])]
-expanded_dfs = ensembling_utils.expand_predictions(sess_dfs)
-train_test_preds_expan_df = expanded_dfs[0]
-val_preds_expan_df = expanded_dfs[1]
 
-# Reindex before concat - make sure feats and expanded preds are alligned
-train_test_preds_expan_df = train_test_preds_expan_df.reindex(index=train_test_feats_df.index)
-val_preds_expan_df = val_preds_expan_df.reindex(index=val_feats_df.index)
+train_test_preds_expan_df = ensembling_utils.expand_predictions(sess_dfs[0], max_num_sessions=30, reindex=train_test_feats_df.index)
+val_preds_expan_df = ensembling_utils.expand_predictions(sess_dfs[1], max_num_sessions=30, reindex=val_feats_df.index)
+
 
 # Final concat
 train_test_user_df = pd.concat([train_test_feats_df, train_test_preds_expan_df], axis=1)
 val_user_df = pd.concat([val_feats_df, val_preds_expan_df], axis=1)
 
-del expanded_dfs, train_test_feats_df, train_test_preds_expan_df, val_feats_df, val_preds_expan_df
+del train_test_feats_df, train_test_preds_expan_df, val_feats_df, val_preds_expan_df
 gc.collect()
 
 # Fill expanded NAs with zeros
@@ -198,13 +204,6 @@ x_train_test_user = train_test_user_df.iloc[:,:-1].values #No longer 1:-1 since 
 y_train_test_user = train_test_user_df.iloc[:,-1].values
 x_val_user = val_user_df.values # No dummy labels to drop this time
 
-# Set log1p of labels
-y_train_test_user = np.log1p(y_train_test_user)
-
-# Get training CV folds
-num_folds = 5
-user_folds = KFold(n_splits=num_folds)
-
 
 
 
@@ -219,7 +218,7 @@ user_bsts = []
 y_val_preds_user = np.zeros((x_val_user.shape[0], num_folds))
 oof_y_train_test_pred_user = np.zeros(y_train_test_user.shape[0])
 
-for i, (train_index, test_index) in enumerate(user_folds.split(np.arange(y_train_test_user.size))):
+for i, (train_index, test_index) in enumerate(user_folds):
 
     # Get current fold
     x_train, y_train = x_train_test_user[train_index], y_train_test_user[train_index]
@@ -228,11 +227,11 @@ for i, (train_index, test_index) in enumerate(user_folds.split(np.arange(y_train
     # Create lgb booster
     bst = lgb.LGBMModel(
         objective='regression',
-        num_leaves = 73,
-        learning_rate = 0.072,
+        num_leaves = 35,
+        learning_rate = 0.035,
         n_estimators = 10000,
-        min_child_samples= 155,
-        subsample=0.99,
+        min_child_samples= 20,
+        subsample=0.95,
         reg_lambda=0.0,
     )
 
@@ -272,12 +271,12 @@ for i, (train_index, test_index) in enumerate(user_folds.split(np.arange(y_train
 
 # Submission
 
-sub_user = pd.DataFrame(data=np.mean(y_val_preds_user, axis=1), index=val_user_df.index)
-mean_cv_str = str(np.mean(cv_scores))
+sub_user = pd.DataFrame(data=np.mean(y_val_preds_user, axis=1), index=val_user_df.index, columns=['PredictedLogRevenue'])
+mean_cv_str = np.mean(cv_scores)
 
 # Save submission file
 sub_user.to_csv(
-    os.getcwd() + '/submissions/' + f'lgbm_user_{i+1:d}cv_{mean_cv_str}.csv',
+    os.getcwd() + '/submissions/' + f'lgbm_user_{i+1:d}cv_{mean_cv_str:.5f}.csv',
     index=True,
     header=True,
     index_label='fullVisitorId',

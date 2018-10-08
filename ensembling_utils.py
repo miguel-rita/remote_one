@@ -1,92 +1,165 @@
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 import numpy as np
 import pandas as pd
-import tqdm
+import pickle, tqdm
 
 
 
 
 
-def get_folds(df=None, n_splits=5):
-    """Returns dataframe indices corresponding of each visitors fold"""
+def get_folds(fullVisitorIdCol=None, n_splits=5, save_to_pkl=False):
+    '''
+    Returns two fold lists, at session and user level
 
-    #TODO - Rethink groupkfold
-    # Get sorted unique visitors
-    unique_vis = np.array(sorted(df['fullVisitorId'].unique()))
+    Both lists are alligned ie. eg. the sessions in fold 1 are the ones corresponding to users in fold 1
 
-    # Get folds
-    folds = KFold(n_splits=n_splits)
-    fold_ids = []
-    ids = np.arange(df.shape[0])
-    for trn_vis, val_vis in folds.split(X=unique_vis):
-        fold_ids.append(
+    :param fullVisitorIdCol: A pd.Series of fullVisitorIds, sorted
+    :param n_splits: Num of splits for CV
+    :param save_to_pkl: If True will save both fold lists to two pickle files : sess_folds.pkl, user_folds.pkl
+    :return: The two aforementioned lists of folds - sess_folds, user_folds
+    '''
+
+    # Get session values
+    sessions = fullVisitorIdCol.values
+
+    # Define groups array ie. one user per group
+    groups = get_np_groups(sessions)
+
+    # GroupKFold on sessions, each group one user
+    sess_folds_it = GroupKFold(n_splits=n_splits)
+    user_folds = []
+    sess_folds = []
+
+    for train, test in sess_folds_it.split(X=sessions, groups=groups):
+
+        # By definition, since each group is a user
+        sess_folds.append([train, test])
+
+        user_folds.append(
             [
-                ids[df['fullVisitorId'].isin(unique_vis[trn_vis])],
-                ids[df['fullVisitorId'].isin(unique_vis[val_vis])]
+                np.unique(groups[train]).astype(int),
+                np.unique(groups[test]).astype(int),
             ]
         )
 
-    return fold_ids
+    if save_to_pkl:
+        pickle.dump(sess_folds, open('sess_folds.pkl', 'wb'))
+        pickle.dump(user_folds, open('user_folds.pkl', 'wb'))
+
+    return sess_folds, user_folds
 
 
 
 
 
-def expand_predictions(id_pred_dfs):
+def get_np_groups(arr):
     '''
-    For each df supplied 'id_pred_dfs' expand its predictions into new dfs when passing from session to user level.
-    This new df will also contain per-user stats eg. sum of all preds (in exp form)
+    Get an array of equal len to arr containing group numbers in ascending order
 
-    :param id_pred_df: List of 2 col dataframes, with first column = user id, second column = prediction (in exp1m form)
-    :return: List of new user-level data frames, with index being unique user id and values predictions
-        for that user. Note that since we have different num. of predictions per user some entries will
-        assume the value np.nan (user didn't have that many sessions)
-        Note that for all new df len(df.columns) = number of stats + max number of session in all supplied dfs
+    Assumes arr to be sorted
+
+    :param arr: Input array
+    :return: Output arr of same lenght containing groups
     '''
 
-    final_dfs = []
+    groups = np.zeros(arr.size)
+    prev_sess = np.nan
+    group_num = -1
+    for i, sess in enumerate(arr):
+        if sess != prev_sess:
+            group_num += 1
+            prev_sess = sess
+        groups[i] = group_num
 
-    # Get list of preds per session for all dfs, as well as global max num of sessions per user
+    return groups
+
+
+
+def expand_np_array(arr, groups, max_cols=30):
+    '''
+    Expand 1D arr values into 2D arr with max_cols. Fills with
+
+    :param arr: Sorted array to expand
+    :param groups: Groups to perform expansion by
+    :param max_cols: Max num of sessions to expand
+    :return: Expanded arr
+    '''
+
+    group_nums, group_starts = np.unique(groups, return_index=True)
+    num_gs = group_starts.size
+
+    expan_arr = np.zeros((num_gs, max_cols))
+    expan_arr.fill(np.nan)
+
+    for i in range(num_gs):
+        gs = group_starts[i]
+        ge = group_starts[i+1] if i < num_gs - 1 else arr.size
+
+        num_expan = ge - gs
+        if num_expan > max_cols:
+            ge = gs + max_cols
+
+        expan_arr[i, :ge-gs] = arr[gs:ge]
+
+
+    return expan_arr
+
+
+
+
+
+def expand_predictions(sorted_preds_df, max_num_sessions=30, reindex=None):
+    '''
+    Expanded sorted_preds into a 2D numpy array, with max_num_sessions cols even if no user has max_num_sessions
+    NaN insert where there was no sess
+
+    :param sorted_preds: pd dataframe with 2 cols : 1st is the sorted fullVisitorId and 2nd the preds
+    :param max_num_sessions: Expand up to max_num_sessions
+    :param reindex: Final index to maintain coherence for future concats
+    :return: Expanded preds in df form, with num_lines = num unique users and num_cols = max_num_sessions
+    '''
 
     print('> Ensembling Tools : Expanding predictions . . .')
 
-    pred_list_by_id_all_dfs = []
-    for id_pred_df in id_pred_dfs:
-        pred_list_by_id_all_dfs.append(id_pred_df.groupby(id_pred_df.columns[0])[id_pred_df.columns[-1]].apply(list))
+
+    pred_values = sorted_preds_df.iloc[:,-1].values
+    ids_values = sorted_preds_df['fullVisitorId']
+
+    expanded_arr = expand_np_array(
+        arr=pred_values,
+        groups=get_np_groups(ids_values),
+        max_cols=max_num_sessions,
+    )
+    num_missing_cols = max_num_sessions - expanded_arr.shape[1] - 2
+    if num_missing_cols > 0: # Means that no user reached max_num_sessions, must complete the array
+        extra_cols = np.zeros(expanded_arr.shape[0], num_missing_cols)
+        extra_cols.fill(np.nan)
+        expanded_arr = np.hstack([expanded_arr, extra_cols])
+
+    # Compute stats
+    stats_names = ['log_mean', 'log_median', 'log_sum', 'sum_log']
+    log_mean = np.log1p(np.nanmean(expanded_arr, axis=1))
+    log_median = np.log1p(np.nanmedian(expanded_arr, axis=1))
+    log_sum = np.log1p(np.nansum(expanded_arr, axis=1))
+    sum_log = np.nansum(np.log1p(expanded_arr), axis=1)
+
+
+    # Concat stats to expanded preds
+    expanded_arr = np.vstack([expanded_arr.T, log_mean, log_median, log_sum, sum_log]).T
+
+    # Create final df
+    final_df = pd.DataFrame(
+        data=expanded_arr,
+        index=reindex,
+        columns=['pred_'+str(i+1) for i in range(max_num_sessions)] + stats_names,
+    )
 
     print('> Ensembling Tools : Done expanding predictions.')
 
-    max_num_preds_per_sess = np.max([[np.max([len(l) for l in pred_list_by_id.values])] for pred_list_by_id in pred_list_by_id_all_dfs])
+    return final_df
 
-    for id_pred_df, pred_list_by_id in zip(id_pred_dfs, pred_list_by_id_all_dfs):
-
-        # Create empty placeholder for final df pred values
-        final_values = np.zeros((pred_list_by_id.shape[0], max_num_preds_per_sess))
-        final_values.fill(np.nan)
-
-        # Assign predictions
-        for i,l in enumerate(pred_list_by_id.values):
-            final_values[i, :len(l)] = l
-
-        # Compute stats
-        stats_names = ['log_mean', 'log_median', 'log_sum']
-        log_mean = np.log1p(np.nanmean(final_values, axis=1))
-        log_median = np.log1p(np.nanmedian(final_values, axis=1))
-        log_sum = np.log1p(np.nansum(final_values, axis=1))
-
-        # Concat stats to expanded preds
-        final_values = np.vstack([final_values.T, log_mean, log_median, log_sum]).T
-
-        # Create final df
-        final_df = pd.DataFrame(
-            data=final_values,
-            index=pred_list_by_id.index,
-            columns=['pred_'+str(i+1) for i in range(max_num_preds_per_sess)] + stats_names,
-        )
-
-        final_dfs.append(final_df)
-
-    return final_dfs
+# ar = expand_np_array(np.array([50,0,50,1,1,1,1,2,2,3,3,3,5,10,10]), np.array([0,0,0,1,1,1,1,2,2,3,3,3,4,5,5]), max_cols=3)
+# print('BOF')
 
 # df = pd.DataFrame(
 #     {
@@ -104,3 +177,8 @@ def expand_predictions(id_pred_dfs):
 # )
 #
 # print(expand_predictions([df,df2]))
+
+# fid = pd.Series([str(x) for x in np.sort([0,0,0,1,1,2,3,3,3,4,5,6])])
+#
+# sess, usr = get_folds(fullVisitorIdCol=fid, n_splits=3)
+# print('Check!')
